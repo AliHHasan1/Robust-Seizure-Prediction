@@ -10,33 +10,79 @@ def get_channels_by_subject(subject_id):
     التعريف العلمي للقنوات حسب المريض (تخصيص Spatial Coverage).
     """
     subject_id = str(subject_id)
+    
+    # 1. القنوات الأساسية (Base Channels) - 18 قناة
     base_chs = [
         'FP1-F7', 'F7-T7', 'T7-P7', 'P7-O1', 'FP1-F3', 'F3-C3', 'C3-P3', 'P3-O1', 
         'FP2-F4', 'F4-C4', 'C4-P4', 'P4-O2', 'FP2-F8', 'F8-T8', 'T8-P8', 'P8-O2', 
         'FZ-CZ', 'CZ-PZ'
     ]
+    # 2. القنوات الإضافية (Extra Channels) - 4 قنوات
     extra_chs = ['P7-T7', 'T7-FT9', 'FT9-FT10', 'FT10-T8']
-
+    
+    # 3. قراءة عدد القنوات المطلوب لهذا المريض من ملف الإعدادات
+    sampling_path = os.path.join(metadata_dir, 'sampling_CHBMIT.csv')
+    if os.path.exists(sampling_path):
+        sampling_df = pd.read_csv(sampling_path)
+        # البحث عن المريض في العمود Subject
+        subject_info = sampling_df[sampling_df['Subject'].astype(str) == subject_id]
+        if not subject_info.empty:
+            num_electrodes = int(subject_info.iloc[0]['Electrode'])
+            
+            # إذا كان المطلوب 18 قناة، نأخذ القنوات الأساسية فقط
+            if num_electrodes == 18:
+                return base_chs
+            # إذا كان المطلوب 22 قناة، نأخذ الأساسية + الإضافية
+            elif num_electrodes == 22:
+                return base_chs + extra_chs
+            # حالات خاصة للمرضى 13 و 16 (17 قناة كما في المستودع الأصلي)
+            elif num_electrodes == 17:
+                return base_chs[:-1]
+    
+    # Fallback في حال عدم وجود الملف أو المريض
     if subject_id in ['13', '16']:
-        return base_chs[:-1] 
-    elif subject_id == '4':
-        special_chs = base_chs.copy()
-        special_chs.remove('T8-P8')
-        return special_chs + ['P8-O2', 'FZ-CZ', 'CZ-PZ', 'P7-T7', 'T7-FT9', 'FT10-T8']
-    else:
-        return base_chs + extra_chs
+        return base_chs[:-1]
+    return base_chs + extra_chs
 
 def get_previous_file_name(current_file):
     """استنتاج اسم الملف السابق لربط الإشارات متصلة زمنياً"""
     try:
-        prefix = current_file.split('_')[0] 
-        seq_str = current_file.split('_')[1].split('.')[0]
-        seq = int(seq_str)
+        # التعامل مع حالات مثل chb01_01.edf أو chb01_01+.edf
+        base_name = os.path.splitext(current_file)[0]
+        if '+' in base_name:
+            base_name = base_name.replace('+', '')
+            
+        parts = base_name.split('_')
+        prefix = parts[0]
+        seq = int(parts[1])
+        
+        if seq <= 1:
+            return None
         return f"{prefix}_{seq-1:02d}.edf"
     except:
         return None
 
-def load_preictal_segment(data_dir, patient_id, edf_file, sz_start_sec):
+def load_raw_with_fallback(file_path, channels):
+    """تحميل ملف EDF مع معالجة اختلاف أسماء القنوات (Case Sensitivity)"""
+    try:
+        raw = read_raw_edf(file_path, preload=True, verbose=False)
+        # توحيد أسماء القنوات لتجنب مشاكل الأحرف الكبيرة والصغيرة
+        available_channels = raw.ch_names
+        target_channels = []
+        for ch in channels:
+            # البحث عن القناة بغض النظر عن حالة الأحرف
+            match = [a for a in available_channels if a.upper() == ch.upper()]
+            if match:
+                target_channels.append(match[0])
+        
+        if len(target_channels) > 0:
+            raw.pick_channels(target_channels)
+            return raw
+    except Exception as e:
+        print(f"Error loading {file_path}: {e}")
+        return None
+
+def load_preictal_segment(data_dir, metadata_dir, patient_id, edf_file, sz_start_sec):
     """
     اقتطاع 30 دقيقة (SOP) قبل النوبة بـ 5 دقائق (SPH).
     """
@@ -47,50 +93,45 @@ def load_preictal_segment(data_dir, patient_id, edf_file, sz_start_sec):
     st = int(sz_start_sec * fs) - SPH - SOP
     sp = int(sz_start_sec * fs) - SPH
     
-    channels = get_channels_by_subject(patient_id)
-    current_file_path = os.path.join(data_dir, f"chb{int(patient_id):02d}", edf_file)
+    channels = get_channels_by_subject(metadata_dir, patient_id)
+    patient_folder = f"chb{int(patient_id):02d}"
+    current_file_path = os.path.join(data_dir, patient_folder, edf_file)
     
-    raw = read_raw_edf(current_file_path, preload=True, verbose=False)
-    raw.pick_channels(channels)
+    raw = load_raw_with_fallback(current_file_path, channels)
+    if raw is None: return None
+
     raw.notch_filter(np.arange(60, 121, 60), fir_design='firwin', verbose=False)
     current_data = raw.get_data().T 
     
     if st < 0:
         prev_file = get_previous_file_name(edf_file)
-        
         if prev_file:
-            prev_path = os.path.join(data_dir, f"chb{int(patient_id):02d}", prev_file)
-            
+            prev_path = os.path.join(data_dir, patient_folder, prev_file)
             if os.path.exists(prev_path):
-                prev_raw = read_raw_edf(prev_path, preload=True, verbose=False)
-                prev_raw.pick_channels(channels)
-                prev_raw.notch_filter(np.arange(60, 121, 60), fir_design='firwin', verbose=False)
-                
-                prev_data = prev_raw.get_data().T
-                
-                data = np.concatenate((prev_data[st:], current_data[:sp]), axis=0)
-                
-                # ✅ تحقق من طول SOP
-                if data.shape[0] != SOP:
-                    return None
-                
-                return data
+                prev_raw = load_raw_with_fallback(prev_path, channels)
+                if prev_raw:
+                    prev_raw.notch_filter(np.arange(60, 121, 60), fir_design='firwin', verbose=False)
+                    prev_data = prev_raw.get_data().T
+                    
+                    # دمج البيانات من الملف السابق والحالي
+                    try:
+                        data = np.concatenate((prev_data[st:], current_data[:sp]), axis=0)
+                        if data.shape[0] != SOP: return None
+                        return data
+                    except:
+                        return None
         
-        # fallback إذا ما في ملف سابق
-        data = current_data[0:sp]
-        
-        if data.shape[0] != SOP:
-            return None
-        
-        return data
+        # fallback إذا لم يوجد ملف سابق أو فشل التحميل
+        if sp > 0:
+            data = current_data[0:sp]
+            # إذا كانت البيانات أقل من SOP، نقوم بالحشو بالأصفار أو تجاهلها (هنا نتجاهلها للحفاظ على الدقة)
+            if data.shape[0] != SOP: return None
+            return data
+        return None
 
     else:
         data = current_data[st:sp]
-        
-        # ✅ تحقق من طول SOP
-        if data.shape[0] != SOP:
-            return None
-        
+        if data.shape[0] != SOP: return None
         return data
 
 
@@ -111,12 +152,13 @@ def load_interictal_segment(data_dir, metadata_dir, patient_id, edf_file):
     تحميل الحالة الطبيعية (Interictal) للمريض.
     يتم هنا تطبيق عمليات القص (Cropping) بناءً على القيود الزمنية في special_interictal.
     """
-    channels = get_channels_by_subject(patient_id)
-    file_path = os.path.join(data_dir, f"chb{int(patient_id):02d}", edf_file)
+    channels = get_channels_by_subject(metadata_dir,patient_id)
+    patient_folder = f"chb{int(patient_id):02d}"
+    file_path = os.path.join(data_dir, patient_folder, edf_file)
     
     # 1. تحميل الإشارة الخام
-    raw = read_raw_edf(file_path, preload=True, verbose=False)
-    raw.pick_channels(channels)
+    raw = load_raw_with_fallback(file_path, channels)
+    if raw is None: return None
     
     # 2. فحص وجود استثناءات زمنية لهذا الملف
     special_df = load_special_interictal_metadata(metadata_dir)
@@ -129,12 +171,14 @@ def load_interictal_segment(data_dir, metadata_dir, patient_id, edf_file):
         
         # إذا كانت القيمة -1 تعني حتى نهاية الملف
         t_end = None if t_end == -1 else t_end
-        raw.crop(tmin=t_start, tmax=t_end)
+        try:
+            raw.crop(tmin=t_start, tmax=t_end)
+        except:
+            pass
+        
     raw.notch_filter(np.arange(60, 121, 60), fir_design='firwin', verbose=False)
     data = raw.get_data().T
-    if data.shape[0] == 0:
-        return None
-    return data
+    return data if data.shape[0] > 0 else None
 
   
 
@@ -173,7 +217,7 @@ def create_windows(data, label_value):
         
         # الانتقال للنافذة التالية بناءً على التداخل
         start_idx += step_len
-        
+    if not windows_X: return np.array([]), np.array([])
     return np.array(windows_X, dtype='float32'), np.array(windows_y, dtype='float32')
 
 def prepare_dataset_by_mode(data_dir, metadata_dir, patient_id, mode='train'):
@@ -187,20 +231,24 @@ def prepare_dataset_by_mode(data_dir, metadata_dir, patient_id, mode='train'):
     target_val = 1 if mode == 'train' else 3
     
     # 2. تحميل ملف segmentation.csv وملف ملخص النوبات
-    seg_df = pd.read_csv(os.path.join(metadata_dir, 'segmentation.csv'), header=None, names=['filename', 'label'])
-    summary_df = pd.read_csv(os.path.join(metadata_dir, 'seizure_summary.csv'))
+    seg_path = os.path.join(metadata_dir, 'segmentation.csv')
+    sum_path = os.path.join(metadata_dir, 'seizure_summary.csv')
+    
+    if not os.path.exists(seg_path) or not os.path.exists(sum_path):
+        print(f"Error: Metadata files not found in {metadata_dir}")
+        return np.array([]), np.array([])
+
+    seg_df = pd.read_csv(seg_path, header=None, names=['filename', 'label'])
+    summary_df = pd.read_csv(sum_path)
     
     final_X = []
     final_y = []
     
-    # 3. الفلترة حسب المريض والنمط (تدريب أو اختبار)
-    # ملاحظة: ملف segmentation يحتوي على أسماء ملفات مثل chb01_01.edf
     patient_prefix = f"chb{int(patient_id):02d}"
-    patient_files = seg_df[
-    (seg_df['filename'].str.startswith(patient_prefix)) &
-    (seg_df['label'] == target_val)
-]
+    patient_files = seg_df[(seg_df['filename'].str.startswith(patient_prefix)) & (seg_df['label'] == target_val)]
     
+    print(f"Processing {len(patient_files)} files for patient {patient_id} ({mode} mode)...")
+
     for _, row in patient_files.iterrows():
         fname = row['filename']
         
@@ -209,87 +257,47 @@ def prepare_dataset_by_mode(data_dir, metadata_dir, patient_id, mode='train'):
         seizure_info = summary_df[summary_df['File_name'] == fname]
 
         if not seizure_info.empty:
-            label = 1
-            
-            prev_sp = -1e12  # لمنع التداخل بين النوبات
-            
+            # حالة Preictal
+            prev_sp = -1e12
             for _, sz_row in seizure_info.iterrows():
                 sz_start = sz_row['Seizure_start']
-                sz_stop = sz_row['Seizure_stop']
-                
                 data = load_preictal_segment(data_dir, patient_id, fname, sz_start)
                 
-                if data is None:
-                    continue
-                
-                fs = 256
-                SOP = 30 * 60 * fs
-                
-                # تحقق من طول العينة (نفس القديم)
-                if data.shape[0] != SOP:
-                    continue
-                
-                # حساب st و sp لنفس منطق القديم
-                st = int(sz_start * fs) - 5 * 60 * fs - SOP
-                sp = int(sz_stop * fs)
-                
-                # منع التداخل
-                if st > prev_sp:
-                    prev_sp = sp
-                    
+                if data is not None:
                     scaled_data = apply_scaling(data)
-                    X_windows, y_windows = create_windows(scaled_data, label)
-                    
-                    if len(X_windows) > 0:
-                        final_X.append(X_windows)
-                        final_y.append(y_windows)
-                else:
-                    prev_sp = sp
+                    X_w, y_w = create_windows(scaled_data, 1)
+                    if X_w.size > 0:
+                        final_X.append(X_w)
+                        final_y.append(y_w)
         else:
-            # حالة Interictal: نطبق منطق الاستثناءات والـ Notch filter
-            label = 0
-    
+            # حالة Interictal
             data = load_interictal_segment(data_dir, metadata_dir, patient_id, fname)
-            
-            if data is None or len(data) == 0:
-                continue
-            
-            fs = 256
-            min_len = 30 * fs
-            if data.shape[0] < min_len:
-                continue
+            if data is not None and len(data) >= (30 * 256):
+                scaled_data = apply_scaling(data)
+                X_w, y_w = create_windows(scaled_data, 0)
+                if X_w.size > 0:
+                    final_X.append(X_w)
+                    final_y.append(y_w)
 
-            scaled_data = apply_scaling(data)
-            X_windows, y_windows = create_windows(scaled_data, label)           
-            if len(X_windows) > 0:
-                final_X.append(X_windows)
-                final_y.append(y_windows)
-            
-
-    # تحويل القوائم إلى مصفوفات Numpy نهائية جاهزة للنموذج
     if not final_X:
         return np.array([]), np.array([])
         
     X = np.concatenate(final_X, axis=0)
     y = np.concatenate(final_y, axis=0)
 
-    # ✅ توحيد عدد العينات (مثل القديم)
-    unique_labels = np.unique(y)
+    # موازنة الفئات (Class Balancing)
+    unique_labels, counts = np.unique(y, return_counts=True)
+    if len(unique_labels) > 1:
+        min_count = min(counts)
+        X_balanced, y_balanced = [], []
+        for lbl in unique_labels:
+            idx = np.where(y == lbl)[0]
+            np.random.shuffle(idx) # خلط العينات قبل الاختيار
+            idx = idx[:min_count]
+            X_balanced.append(X[idx])
+            y_balanced.append(y[idx])
+        X = np.concatenate(X_balanced, axis=0)
+        y = np.concatenate(y_balanced, axis=0)
 
-    min_count = min([np.sum(y == lbl) for lbl in unique_labels])
-
-    X_balanced = []
-    y_balanced = []
-
-    for lbl in unique_labels:
-        idx = np.where(y == lbl)[0][:min_count]
-        X_balanced.append(X[idx])
-        y_balanced.append(y[idx])
-
-    X = np.concatenate(X_balanced, axis=0)
-    y = np.concatenate(y_balanced, axis=0)
-
-    print("Balanced dataset:", X.shape)
-    print("Label distribution:", np.unique(y, return_counts=True))
-
+    print(f"Final Balanced Dataset Shape: {X.shape}")
     return X, y
