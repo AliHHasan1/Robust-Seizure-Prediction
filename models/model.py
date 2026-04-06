@@ -1,6 +1,6 @@
 import tensorflow as tf
 from tensorflow.keras import layers, Model, optimizers, regularizers
-
+import numpy as np
 class CNN_GRU_Modern:
     def __init__(self, dim, noise_limit=0.02, l2_reg=0.001):
         self.win_length = dim[0]
@@ -56,12 +56,11 @@ class Robust_CNN_GRU(CNN_GRU_Modern):
         self.model_optimizer = optimizers.Adam(learning_rate=0.001, clipvalue=1.0)
         self.loss_fn = tf.keras.losses.CategoricalCrossentropy()
 
-    @tf.function
     def generate_adversarial_noise(self, x_input, target_labels, steps=100, lr=0.001):
         """
         توليد ضجيج عدائي يحاكي التحسين التكراري في TF1
         """
-        noise = tf.zeros_like(x_input)
+        noise = tf.Variable(tf.zeros_like(x_input), trainable=True)
         
         for i in tf.range(steps):
             with tf.GradientTape() as tape:
@@ -97,7 +96,7 @@ class Robust_CNN_GRU(CNN_GRU_Modern):
         self.model_optimizer.apply_gradients(zip(gradients, self.model.trainable_variables))
         return loss
 
-    def train_with_adversarial(self, x_train, y_train, epochs_initial=50, epochs_adversarial=15, batch_size=256, percentage=0.4):
+    def train_with_adversarial(self, x_train, y_train, epochs_initial=50, epochs_adversarial=15, batch_size=32, percentage=0.1):
         """
         دالة التدريب الكاملة:
         1. تدريب أولي (Regular Training)
@@ -129,8 +128,18 @@ class Robust_CNN_GRU(CNN_GRU_Modern):
         target_labels = tf.reverse(y_sample, axis=[-1])
         
         # توليد الضجيج
-        x_adv = self.generate_adversarial_noise(x_sample, target_labels, steps=100)
-        
+        adv_list = []
+
+        batch_size_adv = 4  # أو 8 إذا لسا في مشكلة
+
+        for i in range(0, len(x_sample), batch_size_adv):
+            x_batch = x_sample[i:i+batch_size_adv]
+            y_batch = target_labels[i:i+batch_size_adv]
+            
+            x_adv_batch = self.generate_adversarial_noise(x_batch, y_batch, steps=10)
+            adv_list.append(x_adv_batch)
+
+        x_adv = tf.concat(adv_list, axis=0)        
         # 3. التدريب الإضافي مع الأمثلة العدائية
         print(f"Starting Adversarial Training for {epochs_adversarial} epochs...")
         x_combined = tf.concat([x_train, x_adv], axis=0)

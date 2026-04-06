@@ -28,7 +28,7 @@ def get_args():
 
 def run_training(args):
     # 1. إعداد المسارات (يجب تعديلها لتناسب جهازك E:\...)
-    DATA_DIR = "E:/Graduation project/Robust-Seizure-Prediction/CHBMIT"
+    DATA_DIR = "E:\Graduation project\DATA\chb-mit-scalp-eeg-database-1.0.0\chb-mit-scalp-eeg-database-1.0.0"
     METADATA_DIR = "E:/Graduation project/Robust-Seizure-Prediction/data_configs"
     RESULTS_DIR = f"results/results_{args.dataset}_{args.mode}/"
     os.makedirs(RESULTS_DIR, exist_ok=True)

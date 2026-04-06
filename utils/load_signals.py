@@ -5,7 +5,7 @@ import mne
 from mne.io import read_raw_edf
 from sklearn.preprocessing import StandardScaler
 
-def get_channels_by_subject(subject_id):
+def get_channels_by_subject(metadata_dir, subject_id):
     """
     التعريف العلمي للقنوات حسب المريض (تخصيص Spatial Coverage).
     """
@@ -76,13 +76,13 @@ def load_raw_with_fallback(file_path, channels):
                 target_channels.append(match[0])
         
         if len(target_channels) > 0:
-            raw.pick_channels(target_channels)
+            raw.pick(target_channels)
             return raw
     except Exception as e:
         print(f"Error loading {file_path}: {e}")
         return None
 
-def load_preictal_segment(data_dir, metadata_dir, patient_id, edf_file, sz_start_sec):
+def load_preictal_segment(data_dir, metadata_dir, patient_id, edf_file, sz_start):
     """
     اقتطاع 30 دقيقة (SOP) قبل النوبة بـ 5 دقائق (SPH).
     """
@@ -90,8 +90,8 @@ def load_preictal_segment(data_dir, metadata_dir, patient_id, edf_file, sz_start
     SOP = 30 * 60 * fs 
     SPH = 5 * 60 * fs  
     
-    st = int(sz_start_sec * fs) - SPH - SOP
-    sp = int(sz_start_sec * fs) - SPH
+    st = int(sz_start * fs) - SPH - SOP
+    sp = int(sz_start * fs) - SPH
     
     channels = get_channels_by_subject(metadata_dir, patient_id)
     patient_folder = f"chb{int(patient_id):02d}"
@@ -261,7 +261,7 @@ def prepare_dataset_by_mode(data_dir, metadata_dir, patient_id, mode='train'):
             prev_sp = -1e12
             for _, sz_row in seizure_info.iterrows():
                 sz_start = sz_row['Seizure_start']
-                data = load_preictal_segment(data_dir, patient_id, fname, sz_start)
+                data = load_preictal_segment(data_dir, metadata_dir, patient_id, fname, sz_start)
                 
                 if data is not None:
                     scaled_data = apply_scaling(data)
