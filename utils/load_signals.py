@@ -2,6 +2,8 @@ import os
 import numpy as np
 import pandas as pd
 import mne
+import shutil
+import tempfile
 from mne.io import read_raw_edf
 from sklearn.preprocessing import StandardScaler
 
@@ -220,7 +222,7 @@ def create_windows(data, label_value):
     if not windows_X: return np.array([]), np.array([])
     return np.array(windows_X, dtype='float32'), np.array(windows_y, dtype='float32')
 
-def prepare_dataset_by_mode(data_dir, metadata_dir, patient_id, mode='train'):
+def prepare_dataset_by_mode(data_dir, metadata_dir, patient_id, mode='train', return_groups=False, rebuild_cache=False, seed=42):
     fs = 256
     SOP = 30 * 60 * fs 
     """
@@ -241,8 +243,34 @@ def prepare_dataset_by_mode(data_dir, metadata_dir, patient_id, mode='train'):
     seg_df = pd.read_csv(seg_path, header=None, names=['filename', 'label'])
     summary_df = pd.read_csv(sum_path)
     
-    final_X = []
-    final_y = []
+    cache_root = os.path.join('results', 'dataset_cache')
+    patient_cache_dir = os.path.join(cache_root, f"chb{int(patient_id):02d}_{mode}")
+    os.makedirs(patient_cache_dir, exist_ok=True)
+
+    X_cache_path = os.path.join(patient_cache_dir, 'X_balanced.npy')
+    y_cache_path = os.path.join(patient_cache_dir, 'y_balanced.npy')
+    g_cache_path = os.path.join(patient_cache_dir, 'g_balanced.npy')
+
+    # إعادة استخدام الكاش لتجنب إعادة المعالجة الثقيلة
+    if (not rebuild_cache) and os.path.exists(X_cache_path) and os.path.exists(y_cache_path):
+        X_cached = np.load(X_cache_path, mmap_mode='r')
+        y_cached = np.load(y_cache_path, mmap_mode='r')
+        print(f"Loaded cached dataset: {X_cached.shape} from {patient_cache_dir}")
+        if return_groups:
+            if os.path.exists(g_cache_path):
+                g_cached = np.load(g_cache_path, mmap_mode='r')
+                return X_cached, y_cached, g_cached
+            # كاش قديم بدون group ids
+            print("Cached dataset missing seizure groups. Rebuilding cache...")
+        else:
+            return X_cached, y_cached
+
+    # تخزين النوافذ على القرص مؤقتاً بدل RAM
+    build_dir = tempfile.mkdtemp(prefix='build_', dir=patient_cache_dir)
+    chunk_records = {0: [], 1: []}
+    chunk_counter = 0
+    rng = np.random.default_rng(seed)
+    seizure_group_id = 0
     
     patient_prefix = f"chb{int(patient_id):02d}"
     patient_files = seg_df[(seg_df['filename'].str.startswith(patient_prefix)) & (seg_df['label'] == target_val)]
@@ -267,8 +295,13 @@ def prepare_dataset_by_mode(data_dir, metadata_dir, patient_id, mode='train'):
                     scaled_data = apply_scaling(data)
                     X_w, y_w = create_windows(scaled_data, 1)
                     if X_w.size > 0:
-                        final_X.append(X_w)
-                        final_y.append(y_w)
+                        chunk_path = os.path.join(build_dir, f'chunk_{chunk_counter:06d}.npy')
+                        group_path = os.path.join(build_dir, f'group_{chunk_counter:06d}.npy')
+                        np.save(chunk_path, X_w)
+                        np.save(group_path, np.full((len(y_w),), seizure_group_id, dtype='int32'))
+                        chunk_records[1].append({'path': chunk_path, 'group_path': group_path, 'count': int(len(y_w))})
+                        chunk_counter += 1
+                        seizure_group_id += 1
         else:
             # حالة Interictal
             data = load_interictal_segment(data_dir, metadata_dir, patient_id, fname)
@@ -276,28 +309,86 @@ def prepare_dataset_by_mode(data_dir, metadata_dir, patient_id, mode='train'):
                 scaled_data = apply_scaling(data)
                 X_w, y_w = create_windows(scaled_data, 0)
                 if X_w.size > 0:
-                    final_X.append(X_w)
-                    final_y.append(y_w)
+                    chunk_path = os.path.join(build_dir, f'chunk_{chunk_counter:06d}.npy')
+                    group_path = os.path.join(build_dir, f'group_{chunk_counter:06d}.npy')
+                    np.save(chunk_path, X_w)
+                    np.save(group_path, np.full((len(y_w),), -1, dtype='int32'))
+                    chunk_records[0].append({'path': chunk_path, 'group_path': group_path, 'count': int(len(y_w))})
+                    chunk_counter += 1
 
-    if not final_X:
+    total_0 = sum(r['count'] for r in chunk_records[0])
+    total_1 = sum(r['count'] for r in chunk_records[1])
+
+    if total_0 == 0 or total_1 == 0:
+        shutil.rmtree(build_dir, ignore_errors=True)
         return np.array([]), np.array([])
-        
-    X = np.concatenate(final_X, axis=0)
-    y = np.concatenate(final_y, axis=0)
 
-    # موازنة الفئات (Class Balancing)
-    unique_labels, counts = np.unique(y, return_counts=True)
-    if len(unique_labels) > 1:
-        min_count = min(counts)
-        X_balanced, y_balanced = [], []
-        for lbl in unique_labels:
-            idx = np.where(y == lbl)[0]
-            np.random.shuffle(idx) # خلط العينات قبل الاختيار
-            idx = idx[:min_count]
-            X_balanced.append(X[idx])
-            y_balanced.append(y[idx])
-        X = np.concatenate(X_balanced, axis=0)
-        y = np.concatenate(y_balanced, axis=0)
+    min_count = min(total_0, total_1)
+    print(f"Balancing classes on disk: class0={total_0}, class1={total_1}, target={min_count}")
 
-    print(f"Final Balanced Dataset Shape: {X.shape}")
-    return X, y
+    # استنتاج الأبعاد من أول chunk متاح
+    probe_path = chunk_records[0][0]['path'] if chunk_records[0] else chunk_records[1][0]['path']
+    probe = np.load(probe_path, mmap_mode='r')
+    _, win_len, n_channels = probe.shape
+
+    X_balanced = np.lib.format.open_memmap(
+        X_cache_path, mode='w+', dtype='float32', shape=(min_count * 2, win_len, n_channels)
+    )
+    y_balanced = np.lib.format.open_memmap(
+        y_cache_path, mode='w+', dtype='float32', shape=(min_count * 2,)
+    )
+    g_balanced = np.lib.format.open_memmap(
+        g_cache_path, mode='w+', dtype='int32', shape=(min_count * 2,)
+    )
+
+    def write_class_samples(records, class_label, write_pos):
+        total = sum(r['count'] for r in records)
+        sampled_idx = np.arange(total)
+        rng.shuffle(sampled_idx)
+        sampled_idx = np.sort(sampled_idx[:min_count])
+
+        ptr = 0
+        offset = 0
+        for rec in records:
+            start = offset
+            end = offset + rec['count']
+            local_mask = (sampled_idx >= start) & (sampled_idx < end)
+            local_idx = sampled_idx[local_mask] - start
+
+            if len(local_idx) > 0:
+                chunk = np.load(rec['path'], mmap_mode='r')
+                groups = np.load(rec['group_path'], mmap_mode='r')
+                take = chunk[local_idx]
+                take_g = groups[local_idx]
+                next_pos = write_pos + len(take)
+                X_balanced[write_pos:next_pos] = take
+                y_balanced[write_pos:next_pos] = class_label
+                g_balanced[write_pos:next_pos] = take_g
+                write_pos = next_pos
+                ptr += len(take)
+
+            offset = end
+
+        return write_pos, ptr
+
+    pos = 0
+    pos, wrote_0 = write_class_samples(chunk_records[0], 0.0, pos)
+    pos, wrote_1 = write_class_samples(chunk_records[1], 1.0, pos)
+
+    if wrote_0 != min_count or wrote_1 != min_count:
+        shutil.rmtree(build_dir, ignore_errors=True)
+        raise RuntimeError("Disk balancing failed: unexpected sample count.")
+
+    X_balanced.flush()
+    y_balanced.flush()
+    g_balanced.flush()
+
+    shutil.rmtree(build_dir, ignore_errors=True)
+
+    X_out = np.load(X_cache_path, mmap_mode='r')
+    y_out = np.load(y_cache_path, mmap_mode='r')
+    g_out = np.load(g_cache_path, mmap_mode='r')
+    print(f"Final Balanced Dataset Shape: {X_out.shape} (cached at {patient_cache_dir})")
+    if return_groups:
+        return X_out, y_out, g_out
+    return X_out, y_out

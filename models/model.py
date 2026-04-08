@@ -1,6 +1,7 @@
 import tensorflow as tf
 from tensorflow.keras import layers, Model, optimizers, regularizers
 import numpy as np
+
 class CNN_GRU_Modern:
     def __init__(self, dim, noise_limit=0.02, l2_reg=0.001):
         self.win_length = dim[0]
@@ -84,7 +85,6 @@ class Robust_CNN_GRU(CNN_GRU_Modern):
             
         return x_input + noise
 
-    @tf.function
     def train_step(self, x_batch, y_batch):
         """خطوة تدريب عادية (بدون أمثلة عدائية)"""
         with tf.GradientTape() as tape:
@@ -96,24 +96,75 @@ class Robust_CNN_GRU(CNN_GRU_Modern):
         self.model_optimizer.apply_gradients(zip(gradients, self.model.trainable_variables))
         return loss
 
-    def train_with_adversarial(self, x_train, y_train, epochs_initial=50, epochs_adversarial=15, batch_size=32, percentage=0.1):
+    def train_epoch_with_accumulation(self, dataset, accumulation_steps=1):
+        """
+        تدريب Epoch باستخدام micro-batches مع تجميع التدرجات
+        للحفاظ على effective batch كبير دون استهلاك VRAM عالي.
+        """
+        variables = self.model.trainable_variables
+        accumulation_steps = max(1, int(accumulation_steps))
+        accum_grads = [tf.zeros_like(v) for v in variables]
+        epoch_loss = []
+        micro_step = 0
+
+        for x_batch, y_batch in dataset:
+            with tf.GradientTape() as tape:
+                predictions = self.model(x_batch, training=True)
+                loss = self.loss_fn(y_batch, predictions) + tf.add_n(self.model.losses)
+                scaled_loss = loss / accumulation_steps
+
+            grads = tape.gradient(scaled_loss, variables)
+            accum_grads = [
+                ag + (g if g is not None else tf.zeros_like(v))
+                for ag, g, v in zip(accum_grads, grads, variables)
+            ]
+
+            micro_step += 1
+            epoch_loss.append(float(loss.numpy()))
+
+            if micro_step % accumulation_steps == 0:
+                self.model_optimizer.apply_gradients(zip(accum_grads, variables))
+                accum_grads = [tf.zeros_like(v) for v in variables]
+
+        if micro_step % accumulation_steps != 0:
+            self.model_optimizer.apply_gradients(zip(accum_grads, variables))
+
+        return float(np.mean(epoch_loss)) if epoch_loss else 0.0
+
+    def train_with_adversarial(
+        self,
+        x_train,
+        y_train,
+        epochs_initial=50,
+        epochs_adversarial=15,
+        batch_size=32,
+        percentage=0.1,
+        micro_batch_size=8,
+        adv_batch_size=2,
+        adv_steps=10,
+    ):
         """
         دالة التدريب الكاملة:
         1. تدريب أولي (Regular Training)
         2. توليد أمثلة عدائية (AE Generation)
         3. تدريب إضافي مع الأمثلة العدائية (AE Training)
         """
+        micro_batch_size = min(batch_size, max(1, micro_batch_size))
+        accumulation_steps = int(np.ceil(batch_size / micro_batch_size))
+
         # 1. التدريب الأولي
         print(f"Starting Initial Training for {epochs_initial} epochs...")
-        train_ds = tf.data.Dataset.from_tensor_slices((x_train, y_train)).shuffle(len(x_train)).batch(batch_size)
+        train_ds = (
+            tf.data.Dataset.from_tensor_slices((x_train, y_train))
+            .shuffle(len(x_train))
+            .batch(micro_batch_size)
+            .prefetch(1)
+        )
         
         for epoch in range(epochs_initial):
-            epoch_loss = []
-            for x_batch, y_batch in train_ds:
-                loss = self.train_step(x_batch, y_batch)
-                epoch_loss.append(loss)
+            mean_loss = self.train_epoch_with_accumulation(train_ds, accumulation_steps=accumulation_steps)
             if (epoch + 1) % 10 == 0:
-                print(f"Epoch {epoch+1}/{epochs_initial} - Loss: {np.mean(epoch_loss):.4f}")
+                print(f"Epoch {epoch+1}/{epochs_initial} - Loss: {mean_loss:.4f}")
 
         # 2. توليد الأمثلة العدائية
         print(f"Generating Adversarial Examples ({percentage*100}% of data)...")
@@ -129,29 +180,30 @@ class Robust_CNN_GRU(CNN_GRU_Modern):
         
         # توليد الضجيج
         adv_list = []
+        adv_batch_size = max(1, adv_batch_size)
 
-        batch_size_adv = 4  # أو 8 إذا لسا في مشكلة
-
-        for i in range(0, len(x_sample), batch_size_adv):
-            x_batch = x_sample[i:i+batch_size_adv]
-            y_batch = target_labels[i:i+batch_size_adv]
+        for i in range(0, len(x_sample), adv_batch_size):
+            x_batch = x_sample[i:i+adv_batch_size]
+            y_batch = target_labels[i:i+adv_batch_size]
             
-            x_adv_batch = self.generate_adversarial_noise(x_batch, y_batch, steps=10)
+            x_adv_batch = self.generate_adversarial_noise(x_batch, y_batch, steps=adv_steps)
             adv_list.append(x_adv_batch)
 
-        x_adv = tf.concat(adv_list, axis=0)        
+        x_adv = tf.concat(adv_list, axis=0)
         # 3. التدريب الإضافي مع الأمثلة العدائية
         print(f"Starting Adversarial Training for {epochs_adversarial} epochs...")
         x_combined = tf.concat([x_train, x_adv], axis=0)
         y_combined = tf.concat([y_train, y_sample], axis=0) # نستخدم الـ labels الأصلية
         
-        combined_ds = tf.data.Dataset.from_tensor_slices((x_combined, y_combined)).shuffle(len(x_combined)).batch(batch_size)
+        combined_ds = (
+            tf.data.Dataset.from_tensor_slices((x_combined, y_combined))
+            .shuffle(len(x_combined))
+            .batch(micro_batch_size)
+            .prefetch(1)
+        )
         
         for epoch in range(epochs_adversarial):
-            epoch_loss = []
-            for x_batch, y_batch in combined_ds:
-                loss = self.train_step(x_batch, y_batch)
-                epoch_loss.append(loss)
-            print(f"Adv Epoch {epoch+1}/{epochs_adversarial} - Loss: {np.mean(epoch_loss):.4f}")
+            mean_loss = self.train_epoch_with_accumulation(combined_ds, accumulation_steps=accumulation_steps)
+            print(f"Adv Epoch {epoch+1}/{epochs_adversarial} - Loss: {mean_loss:.4f}")
         
         print("Training Complete.")

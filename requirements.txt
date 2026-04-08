@@ -1,0 +1,10 @@
+tensorflow-gpu==2.10.0
+numpy<2.0.0
+pandas
+mne
+scipy
+scikit-learn
+matplotlib
+seaborn
+h5py
+tqdm

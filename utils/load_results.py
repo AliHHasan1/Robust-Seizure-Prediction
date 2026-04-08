@@ -2,6 +2,7 @@ import os
 import pickle
 import numpy as np
 import matplotlib.pyplot as plt
+import pandas as pd
 from sklearn.metrics import roc_auc_score, auc, roc_curve, confusion_matrix
 
 def load_results(path, dataset, patients_list=None):
