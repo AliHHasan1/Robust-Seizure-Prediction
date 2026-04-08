@@ -47,42 +47,34 @@ def calculate_fpr(pred, test):
     - يطلق إنذار إذا كانت 8 نوافذ من أصل 10 إيجابية (Seizure Predicted).
     - الإنذار الواحد يغطي فترة 35 دقيقة (أي يتم تجاهل أي إنذارات أخرى خلال هذه الفترة).
     """
-    fpr_count = 0
+    fpr = 0
     seg = []
-    
-    # 1. استخراج التوقعات الخاصة بفترات Interictal فقط (Label = 0)
-    # ملاحظة: التوقعات يجب أن تكون Class IDs (0 or 1)
-    interictal_indices = np.where(test == 0)[0]
-    if len(interictal_indices) == 0:
-        return 0
-        
-    pred_interictal = pred[interictal_indices]
-    
-    # 2. تحويل النوافذ إلى قطع 5 دقائق (كل قطعة تحتوي 10 نوافذ)
-    # المنهجية الأصلية: n_five_mins = (len(pred)/10) + 1
-    n_five_mins = (len(pred_interictal) // 10)
-    
-    for i in range(n_five_mins):
-        win = pred_interictal[i*10 : (i+1)*10]
-        # إذا كان هناك 8 نوافذ إيجابية أو أكثر من أصل 10
+    test = np.array(test)
+    pred = pred[np.where(test == 0)[0]]
+
+    n_five_mins = (len(pred) / 10) + 1
+    counter = 0
+    while (counter + 1) <= n_five_mins:
+        win = pred[counter * 10:(counter + 1) * 10]
         r = np.count_nonzero(win)
-        seg.append(1 if r >= 8 else 0)
-    
-    # 3. منطق استمرار الإنذار لمدة 35 دقيقة (7 قطع من فئة 5 دقائق)
-    j = 0
-    while j < len(seg):
-        if seg[j] == 1:
-            fpr_count += 1  # تسجيل إنذار كاذب
-            j += 7    # قفز 35 دقيقة (7 قطع * 5 دقائق) لأن الإنذار مستمر
+        if r >= 8:
+            seg.append(1)
         else:
-            j += 1
-    
-    # 4. حساب المعدل لكل ساعة
-    # إجمالي الساعات = (عدد قطع الـ 5 دقائق * 5) / 60
-    total_hours = (n_five_mins * 5) / 60
-    fpr_per_hour = fpr_count / total_hours if total_hours > 0 else 0
-    
-    return fpr_per_hour
+            seg.append(0)
+        counter += 1
+
+    j = 0
+    if len(seg) > 0:
+        while j + 7 <= len(seg):
+            if seg[j] == 1:
+                j += 7
+                fpr += 1
+            else:
+                j += 1
+        fpr = fpr / (n_five_mins * 5 / 60)
+    else:
+        fpr = 0
+    return fpr
 
 def calculate_sensitivity(y_true, y_pred):
     """

@@ -7,8 +7,8 @@ import sys
 import gc
 
 # استيراد الأجزاء المحدثة من المجلدات التنظيمية
-from utils.load_signals import prepare_dataset_by_mode 
-from models.helping_functions import calc_metrics, collect_results
+from utils.load_signals import PrepData
+from models.helping_functions import train_val_cv_split, calc_metrics, collect_results
 from utils.load_results import summary_results, load_results
 from utils.save_load import savefile, load_hickle_file
 from models.model import Robust_CNN_GRU 
@@ -24,7 +24,7 @@ def get_args():
     parser.add_argument('-b', '--batch_size', type=int, default=24, help='Effective batch size')
     parser.add_argument('--micro_batch_size', type=int, default=6, help='Micro-batch size per GPU step')
     parser.add_argument('--adv_batch_size', type=int, default=2, help='Batch size for adversarial sample generation')
-    parser.add_argument('--adv_steps', type=int, default=10, help='Iterations for adversarial sample generation')
+    parser.add_argument('--adv_steps', type=int, default=100, help='Iterations for adversarial sample generation')
     parser.add_argument('-e_init', '--epochs_initial', type=int, default=50, help='Initial training epochs')
     parser.add_argument('-e_adv', '--epochs_adversarial', type=int, default=15, help='Adversarial training epochs')
     parser.add_argument('-perc', '--percentage', type=float, default=0.4, help='Percentage of AE data')
@@ -43,34 +43,41 @@ def configure_gpu():
         except RuntimeError as e:
             print(f"Could not enable memory growth: {e}")
 
-def run_training(args):
+
+def data_loading(target, settings):
+    """
+    واجهة متوافقة مع المستودع القديم: تعيد ictal/interictal folds للمريض.
+    """
+    print('Data Loading...................................')
+    ictal_X, ictal_y = PrepData(target, type='ictal', settings=settings).apply()
+    interictal_X, interictal_y = PrepData(target, type='interictal', settings=settings).apply()
+    return ictal_X, ictal_y, interictal_X, interictal_y
+
+def train(args):
     np.random.seed(args.seed)
     tf.random.set_seed(args.seed)
+    target = args.patient_id
 
     # 1. إعداد المسارات (يجب تعديلها لتناسب جهازك E:\...)
     DATA_DIR = r"E:\Graduation project\DATA\chb-mit-scalp-eeg-database-1.0.0\chb-mit-scalp-eeg-database-1.0.0"
     METADATA_DIR = "E:/Graduation project/Robust-Seizure-Prediction/data_configs"
     RESULTS_DIR = f"results/results_{args.dataset}_{args.mode}/"
     os.makedirs(RESULTS_DIR, exist_ok=True)
+    settings = {
+        "dataset": args.dataset,
+        "datadir": DATA_DIR,
+        "metadata_dir": METADATA_DIR,
+        "rebuild_cache": args.rebuild_cache
+    }
 
-    print(f"\n--- Starting Training for Patient {args.patient_id} ---")
+    print(f"\n--- Starting Training for Patient {target} ---")
     
-    # 2. تحميل البيانات (Preictal & Interictal)
-    # ملاحظة: في المنهجية العلمية، نحتاج لفصل النوبات لعمل Cross-Validation
-    # سنقوم هنا بتحميل البيانات كاملة ثم تقسيمها داخل حلقة الـ CV
-    X, y, groups = prepare_dataset_by_mode(
-        DATA_DIR,
-        METADATA_DIR,
-        args.patient_id,
-        mode='train',
-        return_groups=True,
-        rebuild_cache=args.rebuild_cache,
-        seed=args.seed
-    )
-    
-    if X.size == 0:
-        print(f"No data found for patient {args.patient_id}. Skipping...")
-        return
+    # 2. تحميل البيانات بنمط TF1 (folds مستقلة للنوبات)
+    ictal_X, ictal_y, interictal_X, interictal_y = data_loading(target, settings)
+
+    if len(ictal_X) < 2 or len(interictal_X) < 2:
+        print(f"Insufficient TF1-style folds for patient {target}. Skipping...")
+        return settings
 
     # 3. إعداد هيكل النتائج (History)
     history = {
@@ -82,51 +89,19 @@ def run_training(args):
         'y_test': []
     }
 
-    # 4. تطبيق Cross-Validation بنفس منطق التقسيم الحالي (3 folds)
-    
-    y_int = np.asarray(y, dtype=np.int32)
-    ictal_indices = np.where(y_int == 1)[0]
-    interictal_indices = np.where(y_int == 0)[0]
-
-    ictal_group_ids = np.unique(groups[ictal_indices])
-    ictal_group_ids = ictal_group_ids[ictal_group_ids >= 0]
-    n_folds = len(ictal_group_ids)
-    if n_folds < 2:
-        raise ValueError("Not enough seizures to perform LOSO cross-validation.")
-
-    rng = np.random.default_rng(args.seed)
-    inter_perm = interictal_indices.copy()
-    rng.shuffle(inter_perm)
-    interictal_folds = np.array_split(inter_perm, n_folds)
-
+    # 4. LOSO CV بنفس helper الخاص بالنسخة الأصلية
     fold = 1
-    for i, test_group in enumerate(ictal_group_ids):
-        test_ictal_idx = np.where((y_int == 1) & (groups == test_group))[0]
-        test_interictal_pool = interictal_folds[i]
-        test_interictal_idx = test_interictal_pool[:len(test_ictal_idx)]
-
-        train_ictal_idx = np.where((y_int == 1) & (groups != test_group))[0]
-        train_interictal_idx = np.concatenate([interictal_folds[j] for j in range(n_folds) if j != i], axis=0)
-
-        # موازنة interictal في التدريب مثل المنطق الأصلي
-        train_interictal_idx = train_interictal_idx[:len(train_ictal_idx)]
-
-        split_idx = int(len(train_ictal_idx) * 0.9)
-        train_idx = np.concatenate([train_ictal_idx[:split_idx], train_interictal_idx[:split_idx]], axis=0)
-        val_idx = np.concatenate([train_ictal_idx[split_idx:], train_interictal_idx[split_idx:]], axis=0)
-        test_idx = np.concatenate([test_ictal_idx, test_interictal_idx], axis=0)
-
-        rng.shuffle(train_idx)
-        rng.shuffle(val_idx)
-        
+    for X_train, y_train_raw, X_val, y_val_raw, X_test, y_test_raw in train_val_cv_split(
+        ictal_X, ictal_y, interictal_X, interictal_y, val_ratio=0.1, is_shuffling=True
+    ):
         print(f"\n--- Fold {fold} ---")
 
-        X_train = np.asarray(X[train_idx], dtype=np.float32)
-        y_train = tf.keras.utils.to_categorical(y_int[train_idx], num_classes=2)
-        X_val = np.asarray(X[val_idx], dtype=np.float32)
-        y_val = tf.keras.utils.to_categorical(y_int[val_idx], num_classes=2)
-        X_test = np.asarray(X[test_idx], dtype=np.float32)
-        y_test = tf.keras.utils.to_categorical(y_int[test_idx], num_classes=2)
+        X_train = np.asarray(X_train, dtype=np.float32)
+        y_train = tf.keras.utils.to_categorical(np.asarray(y_train_raw, dtype=np.int32), num_classes=2)
+        X_val = np.asarray(X_val, dtype=np.float32)
+        y_val = tf.keras.utils.to_categorical(np.asarray(y_val_raw, dtype=np.int32), num_classes=2)
+        X_test = np.asarray(X_test, dtype=np.float32)
+        y_test = tf.keras.utils.to_categorical(np.asarray(y_test_raw, dtype=np.int32), num_classes=2)
 
         input_dim = (X_train.shape[1], X_train.shape[2]) # (7168, 18)
         current_batch = args.batch_size
@@ -140,6 +115,7 @@ def run_training(args):
                 if args.mode == 'AE':
                     model_wrapper.train_with_adversarial(
                         X_train, y_train,
+                        x_val=X_val, y_val=y_val,
                         epochs_initial=args.epochs_initial,
                         epochs_adversarial=args.epochs_adversarial,
                         batch_size=current_batch,
@@ -149,17 +125,13 @@ def run_training(args):
                         adv_steps=args.adv_steps
                     )
                 else:
-                    # تدريب عادي فقط
-                    model_wrapper.model.compile(
-                        optimizer=tf.keras.optimizers.Adam(learning_rate=0.001, clipvalue=1.0),
-                        loss='categorical_crossentropy',
-                        metrics=['accuracy']
-                    )
-                    model_wrapper.model.fit(
+                    # تدريب عادي بنمط أقرب لـ TF1
+                    model_wrapper.train(
                         X_train, y_train,
-                        validation_data=(X_val, y_val),
+                        X_val, y_val,
                         epochs=args.epochs_initial,
-                        batch_size=current_batch
+                        batch_size=current_batch,
+                        verbose=True
                     )
                 break
             except tf.errors.ResourceExhaustedError:
@@ -172,7 +144,7 @@ def run_training(args):
                 gc.collect()
 
         # التقييم على بيانات الاختبار (المستبعدة في هذا الـ Fold)
-        y_pred_probs = model_wrapper.model.predict(X_test)
+        y_pred_probs = model_wrapper.predict(X_test)
         metrics = calc_metrics(y_test, y_pred_probs)
         
         # تجميع النتائج
@@ -185,14 +157,15 @@ def run_training(args):
         fold += 1
 
     # 5. حفظ النتائج النهائية للمريض
-    save_path = os.path.join(RESULTS_DIR, f"history_{args.patient_id}")
+    save_path = os.path.join(RESULTS_DIR, f"history_{target}")
     savefile(history, save_path)
-    print(f"\nResults for Patient {args.patient_id} saved to {save_path}.pkl")
+    print(f"\nResults for Patient {target} saved to {save_path}.pkl")
+    return settings
 
 def main():
     configure_gpu()
     args = get_args()
-    run_training(args)
+    settings = train(args)
     
     # عرض ملخص النتائج (إذا كان هناك نتائج سابقة)
     # summary_results([args.patient_id], load_results(f"results/results_{args.dataset}_{args.mode}/", args.dataset)[0])

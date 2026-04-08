@@ -4,87 +4,66 @@ import pandas as pd
 import mne
 import shutil
 import tempfile
+import pickle
 from mne.io import read_raw_edf
 from sklearn.preprocessing import StandardScaler
 
 def get_channels_by_subject(metadata_dir, subject_id):
     """
-    التعريف العلمي للقنوات حسب المريض (تخصيص Spatial Coverage).
+    Channel map aligned with the original TF1 repository.
     """
     subject_id = str(subject_id)
-    
-    # 1. القنوات الأساسية (Base Channels) - 18 قناة
-    base_chs = [
-        'FP1-F7', 'F7-T7', 'T7-P7', 'P7-O1', 'FP1-F3', 'F3-C3', 'C3-P3', 'P3-O1', 
-        'FP2-F4', 'F4-C4', 'C4-P4', 'P4-O2', 'FP2-F8', 'F8-T8', 'T8-P8', 'P8-O2', 
+    base_18 = [
+        'FP1-F7', 'F7-T7', 'T7-P7', 'P7-O1', 'FP1-F3', 'F3-C3', 'C3-P3', 'P3-O1',
+        'FP2-F4', 'F4-C4', 'C4-P4', 'P4-O2', 'FP2-F8', 'F8-T8', 'T8-P8', 'P8-O2',
         'FZ-CZ', 'CZ-PZ'
     ]
-    # 2. القنوات الإضافية (Extra Channels) - 4 قنوات
-    extra_chs = ['P7-T7', 'T7-FT9', 'FT9-FT10', 'FT10-T8']
-    
-    # 3. قراءة عدد القنوات المطلوب لهذا المريض من ملف الإعدادات
-    sampling_path = os.path.join(metadata_dir, 'sampling_CHBMIT.csv')
-    if os.path.exists(sampling_path):
-        sampling_df = pd.read_csv(sampling_path)
-        # البحث عن المريض في العمود Subject
-        subject_info = sampling_df[sampling_df['Subject'].astype(str) == subject_id]
-        if not subject_info.empty:
-            num_electrodes = int(subject_info.iloc[0]['Electrode'])
-            
-            # إذا كان المطلوب 18 قناة، نأخذ القنوات الأساسية فقط
-            if num_electrodes == 18:
-                return base_chs
-            # إذا كان المطلوب 22 قناة، نأخذ الأساسية + الإضافية
-            elif num_electrodes == 22:
-                return base_chs + extra_chs
-            # حالات خاصة للمرضى 13 و 16 (17 قناة كما في المستودع الأصلي)
-            elif num_electrodes == 17:
-                return base_chs[:-1]
-    
-    # Fallback في حال عدم وجود الملف أو المريض
+    extra_4 = ['P7-T7', 'T7-FT9', 'FT9-FT10', 'FT10-T8']
+
+    # Original special handling: patients 13/16 use 17 channels.
     if subject_id in ['13', '16']:
-        return base_chs[:-1]
-    return base_chs + extra_chs
+        return [
+            'FP1-F7', 'F7-T7', 'T7-P7', 'P7-O1', 'FP1-F3', 'F3-C3', 'C3-P3', 'P3-O1',
+            'FP2-F4', 'F4-C4', 'C4-P4', 'P4-O2', 'FP2-F8', 'F8-T8', 'T8-P8', 'FZ-CZ',
+            'CZ-PZ'
+        ]
+
+    # Original special handling: patient 4 uses a custom 20-channel set.
+    if subject_id == '4':
+        return [
+            'FP1-F7', 'F7-T7', 'T7-P7', 'P7-O1', 'FP1-F3', 'F3-C3', 'C3-P3', 'P3-O1',
+            'FP2-F4', 'F4-C4', 'C4-P4', 'P4-O2', 'FP2-F8', 'F8-T8', 'P8-O2', 'FZ-CZ',
+            'CZ-PZ', 'P7-T7', 'T7-FT9', 'FT10-T8'
+        ]
+
+    return base_18 + extra_4
 
 def get_previous_file_name(current_file):
-    """استنتاج اسم الملف السابق لربط الإشارات متصلة زمنياً"""
+    """
+    Previous EDF naming aligned with original TF1 logic, including chb02_16+.edf.
+    """
     try:
-        # التعامل مع حالات مثل chb01_01.edf أو chb01_01+.edf
-        base_name = os.path.splitext(current_file)[0]
-        if '+' in base_name:
-            base_name = base_name.replace('+', '')
-            
-        parts = base_name.split('_')
-        prefix = parts[0]
-        seq = int(parts[1])
-        
-        if seq <= 1:
-            return None
-        return f"{prefix}_{seq-1:02d}.edf"
-    except:
+        if current_file == 'chb02_16+.edf':
+            return 'chb02_16.edf'
+        if current_file[6] == '_':
+            seq = int(current_file[7:9])
+            return f"{current_file[:6]}_{seq-1:02d}.edf"
+        seq = int(current_file[6:8])
+        return f"{current_file[:5]}_{seq-1:02d}.edf"
+    except Exception:
         return None
 
 def load_raw_with_fallback(file_path, channels):
-    """تحميل ملف EDF مع معالجة اختلاف أسماء القنوات (Case Sensitivity)"""
+    """Load EDF and pick channels with TF1-like strict channel names."""
     try:
         raw = read_raw_edf(file_path, preload=True, verbose=False)
-        # توحيد أسماء القنوات لتجنب مشاكل الأحرف الكبيرة والصغيرة
-        available_channels = raw.ch_names
-        target_channels = []
-        for ch in channels:
-            # البحث عن القناة بغض النظر عن حالة الأحرف
-            match = [a for a in available_channels if a.upper() == ch.upper()]
-            if match:
-                target_channels.append(match[0])
-        
-        if len(target_channels) > 0:
-            raw.pick(target_channels)
-            return raw
+        raw.pick(channels)
+        return raw
     except Exception as e:
         print(f"Error loading {file_path}: {e}")
         return None
 
-def load_preictal_segment(data_dir, metadata_dir, patient_id, edf_file, sz_start):
+def load_preictal_segment(data_dir, metadata_dir, patient_id, edf_file, sz_start, sz_stop=None, prev_sp=-1e12):
     """
     اقتطاع 30 دقيقة (SOP) قبل النوبة بـ 5 دقائق (SPH).
     """
@@ -92,8 +71,10 @@ def load_preictal_segment(data_dir, metadata_dir, patient_id, edf_file, sz_start
     SOP = 30 * 60 * fs 
     SPH = 5 * 60 * fs  
     
-    st = int(sz_start * fs) - SPH - SOP
-    sp = int(sz_start * fs) - SPH
+    st = int(sz_start * fs) - SPH
+    sp = int(sz_stop * fs) if sz_stop is not None else st
+    if (st - SOP) <= prev_sp:
+        return None
     
     channels = get_channels_by_subject(metadata_dir, patient_id)
     patient_folder = f"chb{int(patient_id):02d}"
@@ -105,7 +86,7 @@ def load_preictal_segment(data_dir, metadata_dir, patient_id, edf_file, sz_start
     raw.notch_filter(np.arange(60, 121, 60), fir_design='firwin', verbose=False)
     current_data = raw.get_data().T 
     
-    if st < 0:
+    if st - SOP < 0:
         prev_file = get_previous_file_name(edf_file)
         if prev_file:
             prev_path = os.path.join(data_dir, patient_folder, prev_file)
@@ -117,24 +98,35 @@ def load_preictal_segment(data_dir, metadata_dir, patient_id, edf_file, sz_start
                     
                     # دمج البيانات من الملف السابق والحالي
                     try:
-                        data = np.concatenate((prev_data[st:], current_data[:sp]), axis=0)
+                        data = np.concatenate((prev_data[st - SOP:], current_data[:st]), axis=0)
                         if data.shape[0] != SOP: return None
                         return data
                     except:
                         return None
         
         # fallback إذا لم يوجد ملف سابق أو فشل التحميل
-        if sp > 0:
-            data = current_data[0:sp]
+        if st > 0:
+            data = current_data[:st]
             # إذا كانت البيانات أقل من SOP، نقوم بالحشو بالأصفار أو تجاهلها (هنا نتجاهلها للحفاظ على الدقة)
             if data.shape[0] != SOP: return None
             return data
         return None
 
     else:
-        data = current_data[st:sp]
+        data = current_data[st - SOP:st]
         if data.shape[0] != SOP: return None
         return data
+
+
+def _is_patient_file_match(filename, patient_id):
+    patient_id = str(patient_id)
+    return (
+        (f"chb{patient_id}_" in filename) or
+        (f"chb0{patient_id}_" in filename) or
+        (f"chb{patient_id}a_" in filename) or
+        (f"chb{patient_id}b_" in filename) or
+        (f"chb{patient_id}c_" in filename)
+    )
 
 
 def load_special_interictal_metadata(metadata_dir):
@@ -272,8 +264,10 @@ def prepare_dataset_by_mode(data_dir, metadata_dir, patient_id, mode='train', re
     rng = np.random.default_rng(seed)
     seizure_group_id = 0
     
-    patient_prefix = f"chb{int(patient_id):02d}"
-    patient_files = seg_df[(seg_df['filename'].str.startswith(patient_prefix)) & (seg_df['label'] == target_val)]
+    patient_files = seg_df[
+        seg_df['filename'].apply(lambda x: _is_patient_file_match(str(x), patient_id)) &
+        (seg_df['label'] == target_val)
+    ]
     
     print(f"Processing {len(patient_files)} files for patient {patient_id} ({mode} mode)...")
 
@@ -286,10 +280,15 @@ def prepare_dataset_by_mode(data_dir, metadata_dir, patient_id, mode='train', re
 
         if not seizure_info.empty:
             # حالة Preictal
-            prev_sp = -1e12
+            prev_sp = -1e6
             for _, sz_row in seizure_info.iterrows():
                 sz_start = sz_row['Seizure_start']
-                data = load_preictal_segment(data_dir, metadata_dir, patient_id, fname, sz_start)
+                sz_stop = sz_row['Seizure_stop'] if 'Seizure_stop' in sz_row else None
+                data = load_preictal_segment(
+                    data_dir, metadata_dir, patient_id, fname, sz_start, sz_stop=sz_stop, prev_sp=prev_sp
+                )
+                if sz_stop is not None:
+                    prev_sp = int(sz_stop * 256)
                 
                 if data is not None:
                     scaled_data = apply_scaling(data)
@@ -392,3 +391,148 @@ def prepare_dataset_by_mode(data_dir, metadata_dir, patient_id, mode='train', re
     if return_groups:
         return X_out, y_out, g_out
     return X_out, y_out
+
+
+def prepare_dataset_tf1_style_cv(data_dir, metadata_dir, patient_id, rebuild_cache=False):
+    """
+    تجهيز بيانات المريض بنمط قريب جداً من TF1:
+    - ictal folds: fold لكل نوبة (preictal segment لكل seizure event).
+    - interictal folds: كل interictal windows تُجمع ثم تُقسم إلى نفس عدد ictal folds.
+    - بدون global balancing مسبق.
+    """
+    cache_root = os.path.join('results', 'dataset_cache')
+    patient_cache_dir = os.path.join(cache_root, f"chb{int(patient_id):02d}_tf1style_cv")
+    os.makedirs(patient_cache_dir, exist_ok=True)
+    cache_file = os.path.join(patient_cache_dir, 'folds.pkl')
+
+    if (not rebuild_cache) and os.path.exists(cache_file):
+        with open(cache_file, 'rb') as f:
+            cached = pickle.load(f)
+        print(f"Loaded TF1-style cached folds from {cache_file}")
+        return cached['ictal_X'], cached['ictal_y'], cached['interictal_X'], cached['interictal_y']
+
+    seg_path = os.path.join(metadata_dir, 'segmentation.csv')
+    sum_path = os.path.join(metadata_dir, 'seizure_summary.csv')
+    if not os.path.exists(seg_path) or not os.path.exists(sum_path):
+        print(f"Error: Metadata files not found in {metadata_dir}")
+        return [], [], [], []
+
+    seg_df = pd.read_csv(seg_path, header=None, names=['filename', 'label'])
+    summary_df = pd.read_csv(sum_path)
+    # TF1: ictal files تأتي من seizure_summary مباشرة مع نفس مطابقة الأسماء القديمة.
+    patient_seizures = summary_df[summary_df['File_name'].apply(lambda x: _is_patient_file_match(str(x), patient_id))]
+    ictal_X_folds = []
+    ictal_y_folds = []
+
+    # كل seizure event => fold مستقل
+    for fname, seizures_in_file in patient_seizures.groupby('File_name', sort=False):
+        prev_sp = -1e6
+        for _, sz_row in seizures_in_file.iterrows():
+            sz_start = sz_row['Seizure_start']
+            sz_stop = sz_row['Seizure_stop'] if 'Seizure_stop' in sz_row else None
+            data = load_preictal_segment(
+                data_dir, metadata_dir, patient_id, fname, sz_start, sz_stop=sz_stop, prev_sp=prev_sp
+            )
+            if sz_stop is not None:
+                prev_sp = int(sz_stop * 256)
+            if data is None:
+                continue
+
+            scaled = apply_scaling(data)
+            X_w, y_w = create_windows(scaled, 1)
+            if X_w.size == 0:
+                continue
+
+            ictal_X_folds.append(X_w.astype('float32'))
+            ictal_y_folds.append(y_w.astype('float32'))
+
+    if len(ictal_X_folds) < 2:
+        print(f"Insufficient ictal folds for patient {patient_id}.")
+        return [], [], [], []
+
+    n_folds = len(ictal_X_folds)
+
+    # TF1: interictal files من segmentation label=0
+    patient_inter_files = seg_df[
+        seg_df['filename'].apply(lambda x: _is_patient_file_match(str(x), patient_id)) &
+        (seg_df['label'] == 0)
+    ]['filename'].tolist()
+
+    inter_chunks = []
+    for fname in patient_inter_files:
+        data = load_interictal_segment(data_dir, metadata_dir, patient_id, fname)
+        if data is None or len(data) < (30 * 256):
+            continue
+        scaled = apply_scaling(data)
+        X_w, y_w = create_windows(scaled, 0)
+        if X_w.size == 0:
+            continue
+        inter_chunks.append((X_w.astype('float32'), y_w.astype('float32')))
+
+    if len(inter_chunks) == 0:
+        print(f"No interictal windows found for patient {patient_id}.")
+        return [], [], [], []
+
+    interictal_X_all = np.concatenate([c[0] for c in inter_chunks], axis=0)
+    interictal_y_all = np.concatenate([c[1] for c in inter_chunks], axis=0)
+
+    # تقسيم interictal إلى نفس عدد folds كما في TF1 helpers
+    inter_idx_splits = np.array_split(np.arange(len(interictal_X_all)), n_folds)
+    interictal_X_folds = [interictal_X_all[idx] for idx in inter_idx_splits if len(idx) > 0]
+    interictal_y_folds = [interictal_y_all[idx] for idx in inter_idx_splits if len(idx) > 0]
+
+    # لضمان التوافق مع train_val_cv_split (TF1 يعتمد min بين العددين)
+    n_final = min(len(ictal_X_folds), len(interictal_X_folds))
+    ictal_X_folds = ictal_X_folds[:n_final]
+    ictal_y_folds = ictal_y_folds[:n_final]
+    interictal_X_folds = interictal_X_folds[:n_final]
+    interictal_y_folds = interictal_y_folds[:n_final]
+
+    with open(cache_file, 'wb') as f:
+        pickle.dump(
+            {
+                'ictal_X': ictal_X_folds,
+                'ictal_y': ictal_y_folds,
+                'interictal_X': interictal_X_folds,
+                'interictal_y': interictal_y_folds,
+            },
+            f,
+            protocol=pickle.HIGHEST_PROTOCOL
+        )
+    print(f"Saved TF1-style folds cache to {cache_file}")
+
+    return ictal_X_folds, ictal_y_folds, interictal_X_folds, interictal_y_folds
+
+
+class PrepData:
+    """
+    واجهة متوافقة اسمياً مع المستودع القديم:
+    - type='ictal'  => يعيد ictal folds
+    - type='interictal' => يعيد interictal folds
+    """
+    def __init__(self, target, type, settings):
+        self.target = str(target)
+        self.type = type
+        self.settings = settings
+
+    def apply(self):
+        dataset = self.settings.get('dataset', 'CHBMIT')
+        if dataset != 'CHBMIT':
+            raise NotImplementedError("PrepData compatibility wrapper currently supports CHBMIT only.")
+
+        data_dir = self.settings['datadir']
+        metadata_dir = self.settings['metadata_dir']
+        rebuild_cache = bool(self.settings.get('rebuild_cache', False))
+
+        ictal_X, ictal_y, interictal_X, interictal_y = prepare_dataset_tf1_style_cv(
+            data_dir=data_dir,
+            metadata_dir=metadata_dir,
+            patient_id=self.target,
+            rebuild_cache=rebuild_cache
+        )
+
+        if self.type == 'ictal':
+            return ictal_X, ictal_y
+        if self.type == 'interictal':
+            return interictal_X, interictal_y
+        raise ValueError(f"Unsupported PrepData type: {self.type}")
