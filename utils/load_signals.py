@@ -5,6 +5,7 @@ import mne
 import shutil
 import tempfile
 import pickle
+import re
 from mne.io import read_raw_edf
 from sklearn.preprocessing import StandardScaler
 
@@ -54,10 +55,48 @@ def get_previous_file_name(current_file):
         return None
 
 def load_raw_with_fallback(file_path, channels):
-    """Load EDF and pick channels with TF1-like strict channel names."""
+    """
+    Load EDF and pick channels robustly:
+    - exact match first
+    - fallback to case-insensitive + duplicate-suffix tolerant names (e.g., T8-P8-0 -> T8-P8)
+    """
+    def _canon(name):
+        # MNE may rename duplicate channels as "NAME-0", "NAME-1".
+        return re.sub(r"-\d+$", "", str(name).strip()).upper()
+
     try:
         raw = read_raw_edf(file_path, preload=True, verbose=False)
-        raw.pick(channels)
+        available = list(raw.ch_names)
+        available_set = set(available)
+
+        canon_map = {}
+        for ch in available:
+            c = _canon(ch)
+            if c not in canon_map:
+                canon_map[c] = ch
+
+        target_channels = []
+        missing = []
+        for req in channels:
+            if req in available_set:
+                target_channels.append(req)
+                continue
+            mapped = canon_map.get(_canon(req))
+            if mapped is not None:
+                target_channels.append(mapped)
+            else:
+                missing.append(req)
+
+        # Keep deterministic order and avoid duplicate picks.
+        seen = set()
+        target_channels = [ch for ch in target_channels if not (ch in seen or seen.add(ch))]
+        if not target_channels:
+            raise ValueError("No requested channels found in EDF.")
+
+        if missing:
+            print(f"Warning loading {os.path.basename(file_path)}: missing channels {missing}")
+
+        raw.pick(target_channels)
         return raw
     except Exception as e:
         print(f"Error loading {file_path}: {e}")
